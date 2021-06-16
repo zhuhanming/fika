@@ -102,6 +102,7 @@ const matchAvailableUsersPerTimeslot = async (
     sessionCollection.add({
       participants: pair,
       date: admin.firestore.Timestamp.fromDate(date),
+      isCompleted: false,
       timeslot,
     });
     // 2. Update both users' `isAvailable` status
