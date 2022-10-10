@@ -34,12 +34,18 @@ describe('Users', function () {
   };
   const user3: User = {
     ...baseUserData,
-    name: 'testUser2',
+    name: 'testUser3',
     preferredTimeslots: ['breakfast'],
   };
   const user4: User = {
     ...baseUserData,
-    name: 'testUser2',
+    name: 'testUser4',
+    preferredTimeslots: ['tea'],
+  };
+  const user5: User = {
+    ...baseUserData,
+    companyId: '2',
+    name: 'testUser5',
     preferredTimeslots: ['tea'],
   };
 
@@ -124,6 +130,22 @@ describe('Users', function () {
         const user = (await admin.firestore().doc(path).get())?.data();
         assert.equal(user?.isAvailable, true);
         assert.equal(user?.name, user4.name); // Sanity check
+      });
+    });
+
+    it("should not match when there's no available users with same company ID", async function () {
+      // We will first actually create the document, else the triggered function won't work.
+      const createdUser = await admin
+        .firestore()
+        .collection('users')
+        .add(user5);
+      const path = `users/${createdUser.id}`;
+      const snap = test.firestore.makeDocumentSnapshot(user5, path);
+      const wrapped = test.wrap(myFunctions.matchNewUser);
+      await wrapped(snap).then(async () => {
+        const user = (await admin.firestore().doc(path).get())?.data();
+        assert.equal(user?.isAvailable, true);
+        assert.equal(user?.name, user5.name); // Sanity check
       });
     });
 
