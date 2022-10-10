@@ -1,37 +1,201 @@
 import * as functions from 'firebase-functions';
 import * as admin from 'firebase-admin';
+import { Session, Timeslot, User } from './types';
+import { createSession } from './session';
 
 admin.initializeApp();
 
-// Take the text parameter passed to this HTTP endpoint and insert it into
-// Firestore under the path /messages/:documentId/original
-export const addMessage = functions.https.onRequest(async (req, res) => {
-  // Grab the text parameter.
-  const original = req.query.text;
-  // Push the new message into Firestore using the Firebase Admin SDK.
-  const writeResult = await admin
-    .firestore()
-    .collection('messages')
-    .add({ original: original });
-  // Send back a message that we've successfully written the message
-  res.json({ result: `Message with ID: ${writeResult.id} added.` });
-});
+const userCollection = admin.firestore().collection('users');
+const sessionCollection = admin.firestore().collection('sessions');
 
-// Listens for new messages added to /messages/:documentId/original and creates an
-// uppercase version of the message to /messages/:documentId/uppercase
-export const makeUppercase = functions.firestore
-  .document('/messages/{documentId}')
-  .onCreate((snap, context) => {
-    // Grab the current value of what was written to Firestore.
-    const original = snap.data().original;
+// Listens for newly created users and try to match them with someone for their first session.
+export const matchNewUser = functions.firestore
+  .document('users/{userId}')
+  .onCreate(async (snap) => {
+    const newUser = snap.data() as User;
 
-    // Access the parameter `{documentId}` with `context.params`
-    functions.logger.log('Uppercasing', context.params.documentId, original);
-
-    const uppercase = original.toUpperCase();
-
-    // You must return a Promise when performing asynchronous tasks inside a Functions such as
-    // writing to Firestore.
-    // Setting an 'uppercase' field in Firestore document returns a Promise.
-    return snap.ref.set({ uppercase }, { merge: true });
+    try {
+      return admin.firestore().runTransaction(async (transaction) => {
+        return transaction
+          .get(
+            userCollection
+              .where('__name__', '!=', snap.id)
+              .where('isAvailable', '==', true)
+              .where('companyId', '==', newUser.companyId)
+              .where(
+                'preferredTimeslots',
+                'array-contains-any',
+                newUser.preferredTimeslots,
+              ),
+          )
+          .then((users) => {
+            if (users.empty) {
+              return;
+            }
+            // We'll just match with the first available user
+            const matchedUser = users.docs[0];
+            const session = createSession(
+              [snap.id, matchedUser.id],
+              newUser.preferredTimeslots.filter((t) =>
+                matchedUser.data().preferredTimeslots.includes(t),
+              )[0],
+            );
+            transaction.update(userCollection.doc(snap.id), {
+              isAvailable: false,
+            });
+            transaction.update(userCollection.doc(matchedUser.id), {
+              isAvailable: false,
+            });
+            transaction.create(sessionCollection.doc(), session);
+          });
+      });
+    } catch (error) {
+      functions.logger.error(error);
+    }
   });
+
+// Listens for users who have updated their preferred timeslots and try to match them with someone.
+export const matchUpdatedUser = functions.firestore
+  .document('users/{userId}')
+  .onUpdate(async (snap) => {
+    const userBefore = snap.before.data() as User;
+    const userAfter = snap.after.data() as User;
+
+    // We won't bother handling the update if it isn't a change to their preferences
+    if (
+      userBefore.preferredTimeslots.length ===
+        userAfter.preferredTimeslots.length &&
+      userBefore.preferredTimeslots.every((t) =>
+        userAfter.preferredTimeslots.includes(t),
+      )
+    ) {
+      return;
+    }
+
+    // Even if it's a change to preferences, if they're not available, we also don't
+    // bother trying to pair them.
+    if (!userAfter.isAvailable) {
+      return;
+    }
+
+    try {
+      await admin.firestore().runTransaction(async (transaction) => {
+        matchUniqueUsers(transaction);
+      });
+    } catch (error) {
+      functions.logger.error(error);
+    }
+  });
+
+// Listens for changes to sessions, which would usually be sessions being completed.
+// Upon which, we will try to match the now-unmatched users with others.
+export const matchCompletedUser = functions.firestore
+  .document('sessions/{sessionId}')
+  .onUpdate(async (snap) => {
+    const sessionBefore = snap.before.data() as Session;
+    const sessionAfter = snap.after.data() as Session;
+
+    // We ignore this update if the session wasn't updated to be completed.
+    if (
+      sessionBefore.isCompleted === sessionAfter.isCompleted ||
+      !sessionAfter.isCompleted
+    ) {
+      return;
+    }
+
+    try {
+      await admin.firestore().runTransaction(async (transaction) => {
+        transaction.update(userCollection.doc(sessionAfter.participantIds[0]), {
+          isAvailable: true,
+        });
+        transaction.update(userCollection.doc(sessionAfter.participantIds[1]), {
+          isAvailable: true,
+        });
+      });
+      await admin.firestore().runTransaction(async (transaction) => {
+        matchUniqueUsers(transaction);
+      });
+      // TODO: Run group match and try to maintain uniqueness of matchings
+    } catch (error) {
+      functions.logger.error(error);
+    }
+  });
+
+const matchUniqueUsers = async (
+  transaction: admin.firestore.Transaction,
+): Promise<void> => {
+  const promises = [
+    transaction.get(userCollection.where('isAvailable', '==', true)),
+    // TODO: Find a way to optimise this highly inefficient sessions query
+    transaction.get(sessionCollection.where('isCompleted', '==', true)),
+  ];
+  return Promise.all(promises).then(([users, sessions]) => {
+    const userIds = new Set(users.docs.map((d) => d.id));
+
+    // We first find out all the past pairings where two currently unmatched people are involved
+    const relevantSessions = sessions.docs.filter((d) =>
+      d.data().participantIds.every((id: string) => userIds.has(id)),
+    );
+    const previouslyMatched = new Map<string, Set<string>>();
+    relevantSessions.forEach((s) => {
+      const participantIds = s.data().participantIds;
+      if (!previouslyMatched.has(participantIds[0])) {
+        previouslyMatched.set(participantIds[0], new Set());
+      }
+      if (!previouslyMatched.has(participantIds[1])) {
+        previouslyMatched.set(participantIds[1], new Set());
+      }
+      previouslyMatched.get(participantIds[0])?.add(participantIds[1]);
+      previouslyMatched.get(participantIds[1])?.add(participantIds[0]);
+    });
+
+    // We then slot people into the different timeslots that they can make it for
+    const timeslotToUsers = new Map<Timeslot, (User & { id: string })[]>();
+    timeslotToUsers.set('breakfast', []);
+    timeslotToUsers.set('lunch', []);
+    timeslotToUsers.set('tea', []);
+    users.forEach((u) => {
+      const user = u.data();
+      user.preferredTimeslots.forEach((t: Timeslot) =>
+        timeslotToUsers.get(t)?.push({ ...(user as User), id: u.id }),
+      );
+    });
+
+    // Now, we do the matching, starting from the timeslot with the least number of people
+    const alreadyMatched = new Set<string>();
+    [...timeslotToUsers.entries()]
+      .sort((a, b) => a[1].length - b[1].length)
+      .forEach(([timeslot, users]) => {
+        users.forEach((user, index) => {
+          if (alreadyMatched.has(user.id)) {
+            return;
+          }
+          // We do a naive matching, where we just seek for the next available
+          // user that we can match with
+          for (let i = index + 1; i < users.length; i += 1) {
+            const otherUser = users[i];
+            if (
+              alreadyMatched.has(otherUser.id) ||
+              user.companyId !== otherUser.companyId ||
+              previouslyMatched.get(user.id)?.has(otherUser.id)
+            ) {
+              continue;
+            }
+            alreadyMatched.add(user.id);
+            alreadyMatched.add(otherUser.id);
+            transaction.update(userCollection.doc(user.id), {
+              isAvailable: false,
+            });
+            transaction.update(userCollection.doc(otherUser.id), {
+              isAvailable: false,
+            });
+            transaction.create(
+              sessionCollection.doc(),
+              createSession([user.id, otherUser.id], timeslot),
+            );
+            break;
+          }
+        });
+      });
+  });
+};

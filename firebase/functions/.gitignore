@@ -7,3 +7,6 @@ typings/
 
 # Node.js dependency directory
 node_modules/
+
+# Keys
+fika-*-firebase-adminsdk-*.json
