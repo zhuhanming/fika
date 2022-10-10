@@ -11,43 +11,10 @@ const sessionCollection = admin.firestore().collection('sessions');
 // Listens for newly created users and try to match them with someone for their first session.
 export const matchNewUser = functions.firestore
   .document('users/{userId}')
-  .onCreate(async (snap) => {
-    const newUser = snap.data() as User;
-
+  .onCreate(async () => {
     try {
-      return admin.firestore().runTransaction(async (transaction) => {
-        return transaction
-          .get(
-            userCollection
-              .where('__name__', '!=', snap.id)
-              .where('isAvailable', '==', true)
-              .where('companyId', '==', newUser.companyId)
-              .where(
-                'preferredTimeslots',
-                'array-contains-any',
-                newUser.preferredTimeslots,
-              ),
-          )
-          .then((users) => {
-            if (users.empty) {
-              return;
-            }
-            // We'll just match with the first available user
-            const matchedUser = users.docs[0];
-            const session = createSession(
-              [snap.id, matchedUser.id],
-              newUser.preferredTimeslots.filter((t) =>
-                matchedUser.data().preferredTimeslots.includes(t),
-              )[0],
-            );
-            transaction.update(userCollection.doc(snap.id), {
-              isAvailable: false,
-            });
-            transaction.update(userCollection.doc(matchedUser.id), {
-              isAvailable: false,
-            });
-            transaction.create(sessionCollection.doc(), session);
-          });
+      await admin.firestore().runTransaction(async (transaction) => {
+        return matchUniqueUsers(transaction);
       });
     } catch (error) {
       functions.logger.error(error);
@@ -80,7 +47,7 @@ export const matchUpdatedUser = functions.firestore
 
     try {
       await admin.firestore().runTransaction(async (transaction) => {
-        matchUniqueUsers(transaction);
+        return matchUniqueUsers(transaction);
       });
     } catch (error) {
       functions.logger.error(error);
@@ -113,9 +80,8 @@ export const matchCompletedUser = functions.firestore
         });
       });
       await admin.firestore().runTransaction(async (transaction) => {
-        matchUniqueUsers(transaction);
+        return matchUniqueUsers(transaction);
       });
-      // TODO: Run group match and try to maintain uniqueness of matchings
     } catch (error) {
       functions.logger.error(error);
     }
